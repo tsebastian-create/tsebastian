@@ -1,0 +1,256 @@
+DECLARE my_experiment STRING default 'boe_home/app_home.feed.mule_sq';
+DECLARE start_date DATE default '2025-10-27';
+DECLARE end_date DATE default '2025-11-06';
+DECLARE module_placement_input STRING default 'boe_homescreen_feed';
+
+DECLARE bucketing_id_type INT64;
+
+
+SET bucketing_id_type = (
+  SELECT bucketing_id_type
+  FROM `etsy-data-warehouse-prod.catapult_unified.experiment`
+  WHERE _date = end_date
+    AND experiment_id = my_experiment
+);
+
+CREATE OR REPLACE TABLE `etsy-data-warehouse-dev.tsebastian.ab_first_bucket_initial` 
+OPTIONS(expiration_timestamp =  current_timestamp + interval 7 day )
+AS  
+  SELECT
+    bucketing_id,
+    bucketing_id_type,
+    variant_id,
+    MIN(bucketing_ts) AS bucketing_ts,
+  FROM `etsy-data-warehouse-prod.catapult_unified.bucketing`
+  WHERE _date BETWEEN start_date AND end_date
+    AND experiment_id = my_experiment
+  GROUP BY bucketing_id, bucketing_id_type, variant_id
+;
+
+CREATE OR REPLACE TABLE `etsy-data-warehouse-dev.tsebastian.ab_first_bucket` 
+OPTIONS(expiration_timestamp =  current_timestamp + interval 7 day )
+AS
+  SELECT
+    bucketing_id_type,
+    b.bucketing_id,
+    b.variant_id,
+    COALESCE(MIN(f.event_ts), b.bucketing_ts) AS bucketing_ts
+  FROM  `etsy-data-warehouse-dev.tsebastian.ab_first_bucket_initial` b
+  LEFT JOIN `etsy-data-warehouse-prod.catapult_unified.filtering_event` f    ## qn about this step
+    ON f.bucketing_id = b.bucketing_id
+    AND f._date BETWEEN start_date AND end_date
+    AND f.experiment_id = my_experiment
+    AND f.event_ts >= f.boundary_start_ts
+    AND f.event_ts >= b.bucketing_ts
+  GROUP BY 
+    bucketing_id_type,b.bucketing_id, b.variant_id, b.bucketing_ts
+;
+
+
+CREATE OR REPLACE TABLE `etsy-data-warehouse-dev.tsebastian.subsequent_visits` 
+OPTIONS(expiration_timestamp =  current_timestamp + interval 7 day )
+AS
+ 
+  -- Browser-based experiments (bucketing_id_type = 1)
+  SELECT
+    b.bucketing_id,
+    b.variant_id,
+    v.visit_id,
+    v.user_id,
+    v.items_purchased, 
+    v.total_gms, 
+    v.pages_seen, 
+    v.bounced, 
+    v.referring_domain, 
+    v.canonical_region,
+    v.cart_adds,
+    v.search_info,
+    v._date,
+    
+  FROM `etsy-data-warehouse-dev.tsebastian.ab_first_bucket`  b
+  JOIN `etsy-data-warehouse-prod.weblog.visits` v
+    ON bucketing_id_type = 1 
+    AND b.bucketing_id = v.browser_id
+    AND TIMESTAMP_TRUNC(b.bucketing_ts, SECOND) <= v.end_datetime
+  WHERE v._date BETWEEN start_date AND end_date
+  
+  UNION ALL
+  
+  -- User-based experiments (bucketing_id_type = 2)
+  SELECT
+    b.bucketing_id,
+    b.variant_id,
+    v.visit_id,
+    v.user_id,
+    v.items_purchased, 
+    v.total_gms, 
+    v.pages_seen, 
+    v.bounced, 
+    v.referring_domain, 
+    v.canonical_region,
+    v.cart_adds,
+    v.search_info,
+    v._date
+
+  FROM `etsy-data-warehouse-dev.tsebastian.ab_first_bucket`  b
+  JOIN `etsy-data-warehouse-prod.weblog.visits` v
+    ON bucketing_id_type = 2
+    AND b.bucketing_id = CAST(v.user_id AS STRING)
+    AND TIMESTAMP_TRUNC(b.bucketing_ts, SECOND) <= v.end_datetime
+  WHERE v._date BETWEEN start_date AND end_date    ## why not start_datetime
+;
+
+
+CREATE OR REPLACE TABLE `etsy-data-warehouse-dev.tsebastian.visit_user_rows` 
+OPTIONS(expiration_timestamp =  current_timestamp + interval 7 day )
+ AS 
+  SELECT 
+    visit.variant_id, 
+    candidate_set,
+    items_purchased, 
+    total_gms, 
+    pages_seen, 
+    bounced, 
+    referring_domain, 
+    canonical_region,
+    cart_adds,
+    user_id,
+    visit._date,
+
+    rdl.visit_id, 
+    rdl.seen,
+    rdl.rec_price,
+    rdl.clicked,
+    rdl.added_to_cart,
+    rdl.favorited,
+    rdl.purchased_after_view,
+    rdl.listing_id,
+    rdl.top_channel,
+    rdl.rec_top_category,
+
+  FROM `etsy-data-warehouse-dev.tsebastian.subsequent_visits`  visit
+  JOIN `etsy-data-warehouse-prod.rollups.recsys_delivered_listings` rdl 
+    USING(visit_id)
+  WHERE module_placement =  module_placement_input
+
+;
+
+CREATE OR REPLACE TABLE `etsy-data-warehouse-dev.tsebastian.user_profile_add` 
+OPTIONS(expiration_timestamp =  current_timestamp + interval 7 day )
+
+ AS 
+ WITH  user_searches as 
+    (SELECT
+        v.user_id,           
+        SUM(v.search_info.queries_count) AS user_searches_60d,
+        SUM(v.search_info.queries_count)/COUNT(Distinct visit_id) AS user_search_intensity_60d
+      FROM `etsy-data-warehouse-prod.weblog.visits` v
+        WHERE v._date BETWEEN DATE_SUB(start_date, INTERVAL 60 DAY) AND start_date
+        GROUP BY 1)
+
+  SELECT a.*,
+    b.buyer_segment,
+    date_diff(a._date, DATE(TIMESTAMP_SECONDS(c.first_user_create_date)), DAY) as buyer_tenure,
+    c.is_seller,
+    c.is_admin,
+
+    d.gms_last_12m,
+    d.is_top_buyer,
+    d.top_buyer_type,
+    e.user_searches_60d,
+    e.user_search_intensity_60d,
+
+  FROM  `etsy-data-warehouse-dev.tsebastian.visit_user_rows` a
+  JOIN  `etsy-data-warehouse-prod.catapult.catapult_daily_buyer_segments`  b      USING(user_id,_date) 
+
+  INNER JOIN `etsy-data-warehouse-prod.user_mart.mapped_user_profile` c on a.user_id = c.user_id
+  INNER JOIN `etsy-data-warehouse-prod.buyer360_topbuyer.buyer_status_metrics_daily` d on a.user_id = d.mapped_user_id and a._date = d._date
+  LEFT JOIN user_searches
+            e on a.user_id = e.user_id
+
+;
+
+
+CREATE OR REPLACE TABLE `etsy-data-warehouse-dev.tsebastian.listing_add` 
+OPTIONS(expiration_timestamp =  current_timestamp + interval 7 day )
+ AS 
+
+with listing_reviews as (
+  SELECT listing_id
+      ,AVG(rating) as avg_12m_listing_rating
+      ,COUNT(rating) as nbr_12m_listing_rating
+
+  FROM `etsy-data-warehouse-prod.etsy_shard.shop_transaction_review` str
+  WHERE DATE(TIMESTAMP_SECONDS(str.create_date)) BETWEEN DATE_SUB(start_date, INTERVAL 1 YEAR) AND start_date
+    AND str.is_deleted = 0
+    GROUP BY 1
+)
+
+,cr AS (
+  SELECT
+    lv.listing_id,
+    SAFE_DIVIDE(SUM(CAST(lv.purchased_after_view AS INT64)),
+                COUNT(1)) AS listing_12m_cvr
+  FROM `etsy-data-warehouse-prod.analytics.listing_views` lv
+  WHERE lv._date BETWEEN DATE_SUB(start_date, INTERVAL 1 YEAR) AND start_date
+  GROUP BY 1
+)
+
+SELECT a.*,
+    date_diff(a._date, DATE(TIMESTAMP_SECONDS(b.create_date)), DAY) as listing_age,
+    b.price_usd,
+    b.shop_id,
+    b.user_id AS seller_id,
+    c.quality_score.quality_score,
+    d.is_digital,
+    d.top_category,
+    d.full_path,
+    e.avg_12m_listing_rating,
+    e.nbr_12m_listing_rating,
+    f.listing_12m_cvr
+
+ FROM `etsy-data-warehouse-dev.tsebastian.user_profile_add`  A
+LEFT JOIN `etsy-data-warehouse-prod.listing_mart.listings` 
+          B ON A.listing_id = b.listing_id and b.is_active = 1
+LEFT JOIN `etsy-data-warehouse-prod.listing_mart.derived_listing_indicators`     
+          c on a.listing_id = c.listing_id and c.is_active = 1
+LEFT JOIN `etsy-data-warehouse-prod.listing_mart.listing_attributes`
+          d on A.listing_id = d.listing_id
+LEFT JOIN listing_reviews
+          e on A.listing_id = e.listing_id
+LEFT JOIN cr
+          f on A.listing_id = f.listing_id
+;
+
+
+
+CREATE OR REPLACE TABLE `etsy-data-warehouse-dev.tsebastian.seller_add` 
+OPTIONS(expiration_timestamp =  current_timestamp + interval 7 day )
+ AS 
+with seller_reviews as (
+  SELECT shop_id
+      ,AVG(rating) as avg_12m_seller_rating
+      ,COUNT(rating) as nbr_12m_seller_rating
+
+  FROM `etsy-data-warehouse-prod.etsy_shard.shop_transaction_review` str
+  WHERE DATE(TIMESTAMP_SECONDS(str.create_date)) BETWEEN DATE_SUB(start_date, INTERVAL 1 YEAR) AND start_date
+    AND str.is_deleted = 0
+    GROUP BY 1
+)
+
+SELECT a.*,
+      date_diff(a._date, b.open_date, DAY) as shop_open_tenure,
+      b.avg_active_listing_price_usd as avg_active_seller_listing_price_usd,
+      b.gms_percentile,
+      c.seller_tier_new,
+      d.avg_12m_seller_rating,
+      d.nbr_12m_seller_rating,
+
+
+FROM `etsy-data-warehouse-dev.tsebastian.listing_add` a
+LEFT JOIN `etsy-data-warehouse-prod.rollups.seller_basics` b on a.seller_id = b.user_id
+LEFT JOIN `etsy-data-warehouse-prod.rollups.seller_tier_new_daily_historical` c on a.seller_id = c.user_id and a._date = c.date
+LEFT JOIN seller_reviews
+          d on a.shop_id = d.shop_id
+
+;
