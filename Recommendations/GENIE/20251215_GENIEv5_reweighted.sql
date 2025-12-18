@@ -127,7 +127,8 @@ OPTIONS(expiration_timestamp = current_timestamp + interval 7 day ) AS (
             "backend_favorite_item2", -- favorites
             "search",
             "engaged_visit",
-            "visits"
+            "visits",
+            'total_search_effort'
   ]) AS event_id
 );
 -- Get all the bucketed units with the events of interest.
@@ -259,36 +260,258 @@ OPTIONS(expiration_timestamp = current_timestamp + interval 7 day ) AS (
 -------------------------------------------------------------------------------------------
 -- RECREATE CATAPULT RESULTS
 -------------------------------------------------------------------------------------------
--- Proportion and mean metrics by variant and event_name
-SELECT
+
+-- Per-variant summary (no buyer_segment split)
+-- RECREATE CATAPULT RESULTS: control vs genie variants, with p-values and power
+WITH per_variant AS (
+  SELECT
     event_id,
     variant_id,
-    COUNT(*) AS total_units_in_variant,
+
+    -- counts
+    COUNT(*) AS n_total_units,
+    SUM(IF(event_count > 0, 1, 0)) AS n_units_with_event,
+
+    -- metrics
     AVG(IF(event_count = 0, 0, 1)) AS percent_units_with_event,
     AVG(event_count) AS avg_events_per_unit,
-    AVG(IF(event_count = 0, NULL, event_count)) AS avg_events_per_unit_with_event
-FROM
-    `etsy-data-warehouse-dev.tsebastian.all_units_events_segments`
-GROUP BY
-    event_id, variant_id
-ORDER BY
-    event_id, variant_id;
+    AVG(IF(event_count = 0, NULL, event_count)) AS avg_events_per_unit_with_event,
 
--- Proportion and mean metrics by variant, segment and event_name
+    -- std devs for t-tests / power on means
+    STDDEV_POP(event_count) AS sd_events_per_unit,
+    STDDEV_POP(NULLIF(event_count, 0)) AS sd_events_per_unit_with_event
+  FROM
+    `etsy-data-warehouse-dev.tsebastian.all_units_events_segments`
+  GROUP BY
+    event_id, variant_id
+),
+
+control AS (
+  SELECT *
+  FROM per_variant
+  WHERE variant_id = 'off'
+),
+
+genie_variants AS (
+  SELECT *
+  FROM per_variant
+  WHERE variant_id IN ('50_genie_flash_50_mule', '50_genie_lite_50_mule')
+)
+
 SELECT
+  v.event_id,
+  v.variant_id,
+
+  -- counts
+  c.n_total_units AS control_units,
+  v.n_total_units AS variant_units,
+
+  -- 1) % units with ≥1 event
+  c.percent_units_with_event AS control_pct_units_with_event,
+  v.percent_units_with_event AS variant_pct_units_with_event,
+  SAFE_DIVIDE(
+    v.percent_units_with_event - c.percent_units_with_event,
+    c.percent_units_with_event
+  ) AS lift_pct_units_with_event,
+
+  `etsy-data-warehouse-prod.functions.prop_test_agg`(
+    c.n_total_units,            -- n_control
+    v.n_total_units,            -- n_variant
+    c.n_units_with_event,       -- successes_control
+    v.n_units_with_event        -- successes_variant
+  ).p_value AS pval_pct_units_with_event,
+
+  `etsy-data-warehouse-prod.functions.power_two_proportions`(
+    c.n_total_units,
+    v.n_total_units,
+    c.percent_units_with_event,
+    v.percent_units_with_event
+  ) AS power_pct_units_with_event,
+
+  -- 2) Avg events per unit
+  c.avg_events_per_unit AS control_avg_events_per_unit,
+  v.avg_events_per_unit AS variant_avg_events_per_unit,
+  SAFE_DIVIDE(
+    v.avg_events_per_unit - c.avg_events_per_unit,
+    c.avg_events_per_unit
+  ) AS lift_avg_events_per_unit,
+
+  `etsy-data-warehouse-prod.functions.t_test_agg`(
+    v.n_total_units,            -- n_variant
+    c.n_total_units,            -- n_control
+    v.avg_events_per_unit,      -- mean_variant
+    c.avg_events_per_unit,      -- mean_control
+    v.sd_events_per_unit,       -- sd_variant
+    c.sd_events_per_unit        -- sd_control
+  ).p_value AS pval_avg_events_per_unit,
+
+  `etsy-data-warehouse-prod.functions.power_two_means`(
+    v.n_total_units,
+    c.n_total_units,
+    v.avg_events_per_unit - c.avg_events_per_unit,
+    c.sd_events_per_unit
+  ) AS power_avg_events_per_unit,
+
+  -- 3) Avg events per unit (conditional on having event)
+  c.avg_events_per_unit_with_event AS control_avg_events_per_unit_with_event,
+  v.avg_events_per_unit_with_event AS variant_avg_events_per_unit_with_event,
+  SAFE_DIVIDE(
+    v.avg_events_per_unit_with_event - c.avg_events_per_unit_with_event,
+    c.avg_events_per_unit_with_event
+  ) AS lift_avg_events_per_unit_with_event,
+
+  `etsy-data-warehouse-prod.functions.t_test_agg`(
+    v.n_units_with_event,                 -- n_variant (only units with event)
+    c.n_units_with_event,                 -- n_control
+    v.avg_events_per_unit_with_event,     -- mean_variant
+    c.avg_events_per_unit_with_event,     -- mean_control
+    v.sd_events_per_unit_with_event,      -- sd_variant
+    c.sd_events_per_unit_with_event       -- sd_control
+  ).p_value AS pval_avg_events_per_unit_with_event,
+
+  `etsy-data-warehouse-prod.functions.power_two_means`(
+    v.n_units_with_event,
+    c.n_units_with_event,
+    v.avg_events_per_unit_with_event - c.avg_events_per_unit_with_event,
+    c.sd_events_per_unit_with_event
+  ) AS power_avg_events_per_unit_with_event
+
+FROM
+  genie_variants v
+JOIN
+  control c
+USING (event_id)
+ORDER BY
+  event_id, variant_id;
+
+
+-- split by buyer segment
+  -- RECREATE CATAPULT RESULTS BY BUYER SEGMENT: control vs genie variants
+WITH per_variant_seg AS (
+  SELECT
     event_id,
     variant_id,
     buyer_segment,
-    COUNT(*) AS total_units_in_variant,
+
+    -- counts
+    COUNT(*) AS n_total_units,
+    SUM(IF(event_count > 0, 1, 0)) AS n_units_with_event,
+
+    -- metrics
     AVG(IF(event_count = 0, 0, 1)) AS percent_units_with_event,
     AVG(event_count) AS avg_events_per_unit,
-    AVG(IF(event_count = 0, NULL, event_count)) AS avg_events_per_unit_with_event
-FROM
+    AVG(IF(event_count = 0, NULL, event_count)) AS avg_events_per_unit_with_event,
+
+    -- std devs
+    STDDEV_POP(event_count) AS sd_events_per_unit,
+    STDDEV_POP(NULLIF(event_count, 0)) AS sd_events_per_unit_with_event
+  FROM
     `etsy-data-warehouse-dev.tsebastian.all_units_events_segments`
-GROUP BY
-    event_id, variant_id,buyer_segment
+  GROUP BY
+    event_id, variant_id, buyer_segment
+),
+
+control_seg AS (
+  SELECT *
+  FROM per_variant_seg
+  WHERE variant_id = 'off'
+),
+
+genie_seg AS (
+  SELECT *
+  FROM per_variant_seg
+  WHERE variant_id IN ('50_genie_flash_50_mule', '50_genie_lite_50_mule')
+)
+
+SELECT
+  v.event_id,
+  v.buyer_segment,
+  v.variant_id,
+
+  -- counts
+  c.n_total_units AS control_units,
+  v.n_total_units AS variant_units,
+
+  -- 1) % units with ≥1 event
+  c.percent_units_with_event AS control_pct_units_with_event,
+  v.percent_units_with_event AS variant_pct_units_with_event,
+  SAFE_DIVIDE(
+    v.percent_units_with_event - c.percent_units_with_event,
+    c.percent_units_with_event
+  ) AS lift_pct_units_with_event,
+
+  `etsy-data-warehouse-prod.functions.prop_test_agg`(
+    c.n_total_units,          -- n_control
+    v.n_total_units,          -- n_variant
+    c.n_units_with_event,     -- successes_control
+    v.n_units_with_event      -- successes_variant
+  ).p_value AS pval_pct_units_with_event,
+
+  `etsy-data-warehouse-prod.functions.power_two_proportions`(
+    c.n_total_units,
+    v.n_total_units,
+    c.percent_units_with_event,
+    v.percent_units_with_event
+  ) AS power_pct_units_with_event,
+
+  -- 2) Avg events per unit
+  c.avg_events_per_unit AS control_avg_events_per_unit,
+  v.avg_events_per_unit AS variant_avg_events_per_unit,
+  SAFE_DIVIDE(
+    v.avg_events_per_unit - c.avg_events_per_unit,
+    c.avg_events_per_unit
+  ) AS lift_avg_events_per_unit,
+
+  `etsy-data-warehouse-prod.functions.t_test_agg`(
+    v.n_total_units,          -- n_variant
+    c.n_total_units,          -- n_control
+    v.avg_events_per_unit,    -- mean_variant
+    c.avg_events_per_unit,    -- mean_control
+    v.sd_events_per_unit,     -- sd_variant
+    c.sd_events_per_unit      -- sd_control
+  ).p_value AS pval_avg_events_per_unit,
+
+  `etsy-data-warehouse-prod.functions.power_two_means`(
+    v.n_total_units,
+    c.n_total_units,
+    v.avg_events_per_unit - c.avg_events_per_unit,
+    c.sd_events_per_unit
+  ) AS power_avg_events_per_unit,
+
+  -- 3) Avg events per unit (conditional on having event)
+  c.avg_events_per_unit_with_event AS control_avg_events_per_unit_with_event,
+  v.avg_events_per_unit_with_event AS variant_avg_events_per_unit_with_event,
+  SAFE_DIVIDE(
+    v.avg_events_per_unit_with_event - c.avg_events_per_unit_with_event,
+    c.avg_events_per_unit_with_event
+  ) AS lift_avg_events_per_unit_with_event,
+
+  `etsy-data-warehouse-prod.functions.t_test_agg`(
+    v.n_units_with_event,                 -- n_variant (only units with event)
+    c.n_units_with_event,                 -- n_control
+    v.avg_events_per_unit_with_event,     -- mean_variant
+    c.avg_events_per_unit_with_event,     -- mean_control
+    v.sd_events_per_unit_with_event,      -- sd_variant
+    c.sd_events_per_unit_with_event       -- sd_control
+  ).p_value AS pval_avg_events_per_unit_with_event,
+
+  `etsy-data-warehouse-prod.functions.power_two_means`(
+    v.n_units_with_event,
+    c.n_units_with_event,
+    v.avg_events_per_unit_with_event - c.avg_events_per_unit_with_event,
+    c.sd_events_per_unit_with_event
+  ) AS power_avg_events_per_unit_with_event
+
+FROM
+  genie_seg v
+JOIN
+  control_seg c
+USING (event_id, buyer_segment)
 ORDER BY
-    event_id, variant_id,buyer_segment;
+  event_id, buyer_segment, variant_id;
+
+
+
 
 -------------------------------------------------------------------------------------------
 -- PER-UNIT METRICS BY SEGMENT (INPUTS FOR REWEIGHTING)
@@ -304,8 +527,8 @@ OPTIONS(expiration_timestamp = current_timestamp + interval 7 day ) AS (
     AVG(IF(event_count = 0, 0, 1)) AS pct_units_with_event
   FROM
     `etsy-data-warehouse-dev.tsebastian.all_units_events_segments`
-  WHERE
-    event_id IN ("gms", "feedRecListingviewEngagement", "backend_cart_payment")
+  WHERE 1=1
+  --  and event_id IN ("gms", "feedRecListingviewEngagement", "backend_cart_payment")
     -- and variant_id = '50_genie_flash_50_mule'
   GROUP BY
     ALL

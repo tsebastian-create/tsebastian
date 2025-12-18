@@ -1779,16 +1779,12 @@ pre_ratio AS (
     user_id,
     COALESCE(
       0.6667 * MAX(home_clicks_90),  -- ~60d from 90d
-      2.0    * MAX(home_clicks_30),  -- ~60d from 30d
-      8.5714 * MAX(home_clicks_7),   -- ~60d from 7d
       0
     ) AS clicks_60d_approx,
     COALESCE(MAX(buyer_searches_60d), 0) AS searches_60d,
     SAFE_DIVIDE(
       COALESCE(
         0.6667 * MAX(home_clicks_90),
-        2.0    * MAX(home_clicks_30),
-        8.5714 * MAX(home_clicks_7),
         0
       ),
       NULLIF(COALESCE(MAX(buyer_searches_60d), 0), 0)
@@ -2150,3 +2146,312 @@ ORDER BY
     WHEN 'Direct specified (predominant)' THEN 3
     ELSE 9
   END;
+
+
+-- -- -- -- -- -- -- -- -- 
+-- Q23) New Missions started
+-- -- -- -- -- -- -- -- -- 
+
+  -- PARAMETERS
+DECLARE my_experiment STRING DEFAULT 'boe_home/app_home.feed.mule_sq';
+DECLARE start_date DATE DEFAULT '2025-11-07';
+DECLARE end_date   DATE DEFAULT '2025-11-13';
+DECLARE module_placement_input STRING DEFAULT 'boe_homescreen_feed';
+DECLARE lookback_window INT64 DEFAULT 60;
+
+-- VARIANTS
+DECLARE variants ARRAY<STRING> DEFAULT ['off','mule_sq_100'];
+
+-- Bucketing type for the experiment
+DECLARE bucketing_id_type INT64;
+SET bucketing_id_type = (
+  SELECT bucketing_id_type
+  FROM `etsy-data-warehouse-prod.catapult_unified.experiment`
+  WHERE _date = end_date
+    AND experiment_id = my_experiment
+);
+
+-- 0) Experiment users universe
+WITH exp_users AS (
+  SELECT DISTINCT user_id
+  FROM `etsy-data-warehouse-dev.tsebastian.bound_reset_sq_add`
+  WHERE variant_id IN UNNEST(variants)
+),
+
+-- 1) 60d pre-experiment search CTR (platform=boe)
+search_60d AS (
+  SELECT
+    si.user_id,
+    SAFE_DIVIDE(
+      COUNT(DISTINCT IF(si.clicked > 0, si.listing_id, NULL)),
+      NULLIF(COUNT(DISTINCT si.listing_id), 0)
+    ) AS search_ctr_60d,
+    COUNT(DISTINCT si.mmx_request_uuid) AS searches_60d 
+  FROM `etsy-data-warehouse-prod.rollups.search_impressions` si
+  JOIN exp_users u
+    ON u.user_id = si.user_id
+  WHERE si._date BETWEEN DATE_SUB(start_date, INTERVAL lookback_window DAY)
+                     AND DATE_SUB(start_date, INTERVAL 1 DAY)
+    AND si.platform = 'boe'
+  GROUP BY 1
+),
+
+-- 2) 60d pre-experiment feed CTR for the feed module placement
+feed_60d AS (
+  SELECT
+    v.user_id,
+    SAFE_DIVIDE(SUM(CAST(rdl.clicked AS INT64)), NULLIF(COUNT(1), 0)) AS feed_ctr_60d
+  FROM `etsy-data-warehouse-prod.rollups.recsys_delivered_listings` rdl
+  JOIN `etsy-data-warehouse-prod.visit_mart.visits` v
+    ON v.visit_id = rdl.visit_id
+  WHERE rdl._date BETWEEN DATE_SUB(start_date, INTERVAL lookback_window DAY)
+                      AND DATE_SUB(start_date, INTERVAL 1 DAY)
+    AND rdl.module_placement = module_placement_input
+  GROUP BY 1
+),
+
+-- 3) Build deciles for search CTR and terciles for feed CTR
+search_ranked AS (
+  SELECT
+    u.user_id,
+    s.search_ctr_60d,
+    CASE WHEN s.search_ctr_60d IS NULL THEN NULL
+         ELSE NTILE(10) OVER (ORDER BY s.search_ctr_60d) END AS search_decile,
+    s.searches_60d,  
+  FROM exp_users u
+  LEFT JOIN search_60d s
+    ON s.user_id = u.user_id
+),
+feed_ranked AS (
+  SELECT
+    u.user_id,
+    f.feed_ctr_60d,
+    CASE WHEN f.feed_ctr_60d IS NULL THEN NULL
+         ELSE NTILE(3) OVER (ORDER BY f.feed_ctr_60d) END AS feed_tercile
+  FROM exp_users u
+  LEFT JOIN feed_60d f
+    ON f.user_id = u.user_id
+),
+
+user_strata AS (
+  SELECT
+    sr.user_id,
+    IFNULL(FORMAT('d%02d', sr.search_decile), 'd00_no_search_data') AS search_decile_label,
+    IFNULL(FORMAT('t%d', fr.feed_tercile),   't0_no_feed_data')     AS feed_tercile_label
+  FROM search_ranked sr
+  JOIN feed_ranked fr USING (user_id)
+),
+searches_60d_agg AS (
+  SELECT
+    us.search_decile_label,
+    us.feed_tercile_label,
+    COUNT(DISTINCT us.user_id) AS users_60d,
+    SUM(sr.searches_60d) AS sum_searches_60d
+  FROM user_strata us
+  JOIN search_ranked sr
+    ON sr.user_id = us.user_id
+  GROUP BY 1, 2
+),
+-- 4) CTR metrics from bound reset table (experiment window)
+ctr_agg AS (
+  SELECT
+    us.search_decile_label,
+    us.feed_tercile_label,
+    b.variant_id,
+    SUM(b.rec_seen)    AS exposures,
+    SUM(b.rec_clicked) AS clicks,
+    COUNT(DISTINCT b.user_id) AS n_users
+  FROM `etsy-data-warehouse-dev.tsebastian.bound_reset_sq_add` b
+  JOIN user_strata us
+    ON us.user_id = b.user_id
+  WHERE b.variant_id IN UNNEST(variants)
+  GROUP BY 1, 2, 3
+),
+ctr_pivoted AS (
+  SELECT
+    search_decile_label,
+    feed_tercile_label,
+    -- Control
+    SUM(IF(variant_id = 'off', exposures, 0))   AS exposures_control,
+    SUM(IF(variant_id = 'off', clicks, 0))      AS clicks_control,
+    SUM(IF(variant_id = 'off', n_users, 0))     AS users_control,
+    -- Treatment
+    SUM(IF(variant_id = 'mule_sq_100', exposures, 0))   AS exposures_treatment,
+    SUM(IF(variant_id = 'mule_sq_100', clicks, 0))      AS clicks_treatment,
+    SUM(IF(variant_id = 'mule_sq_100', n_users, 0))     AS users_treatment
+  FROM ctr_agg
+  GROUP BY 1, 2
+),
+
+-- 5) New missions started metric during experiment window
+
+ab_first_bucket_initial AS (
+  SELECT
+    bucketing_id,
+    bucketing_id_type,
+    variant_id,
+    MIN(bucketing_ts) AS bucketing_ts
+  FROM `etsy-data-warehouse-prod.catapult_unified.bucketing`
+  WHERE _date BETWEEN start_date AND end_date
+    AND experiment_id = my_experiment
+  GROUP BY bucketing_id, bucketing_id_type, variant_id
+),
+ab_first_bucket AS (
+  SELECT
+    b.bucketing_id,
+    b.variant_id,
+    COALESCE(MIN(f.event_ts), b.bucketing_ts) AS bucketing_ts
+  FROM ab_first_bucket_initial b
+  LEFT JOIN `etsy-data-warehouse-prod.catapult_unified.filtering_event` f
+    ON f.bucketing_id = b.bucketing_id
+   AND f._date BETWEEN start_date AND end_date
+   AND f.experiment_id = my_experiment
+   AND f.event_ts >= f.boundary_start_ts
+   AND f.event_ts >= b.bucketing_ts
+  GROUP BY b.bucketing_id, b.variant_id, b.bucketing_ts
+),
+subsequent_visits AS (
+  -- Browser-based experiments (bucketing_id_type = 1)
+  SELECT b.bucketing_id, b.variant_id, v.visit_id, v.user_id
+  FROM ab_first_bucket b
+  JOIN `etsy-data-warehouse-prod.weblog.visits` v
+    ON bucketing_id_type = 1
+   AND b.bucketing_id = v.browser_id
+   AND TIMESTAMP_TRUNC(b.bucketing_ts, SECOND) <= v.end_datetime
+   AND v._date BETWEEN start_date AND end_date
+  UNION ALL
+  -- User-based experiments (bucketing_id_type = 2)
+  SELECT b.bucketing_id, b.variant_id, v.visit_id, v.user_id
+  FROM ab_first_bucket b
+  JOIN `etsy-data-warehouse-prod.weblog.visits` v
+    ON bucketing_id_type = 2
+   AND b.bucketing_id = CAST(v.user_id AS STRING)
+   AND TIMESTAMP_TRUNC(b.bucketing_ts, SECOND) <= v.end_datetime
+   AND v._date BETWEEN start_date AND end_date
+),
+precomputed_taxonomy AS (
+  SELECT
+    listing_id,
+    full_path,
+    REGEXP_EXTRACT(full_path, r'^[^.]*') AS l1,
+    REGEXP_EXTRACT(full_path, r'^[^.]*.[^.]*') AS l2,
+    REGEXP_EXTRACT(full_path, r'^[^.]*.[^.]*.[^.]*') AS l3
+  FROM `etsy-data-warehouse-prod.materialized.listing_taxonomy`
+),
+recent_user_taxos_seen AS (
+  SELECT DISTINCT v.user_id, pt.l1, pt.l2, pt.l3, pt.full_path
+  FROM `etsy-data-warehouse-prod.analytics.listing_views` lv
+  JOIN `etsy-data-warehouse-prod.visit_mart.visits` v2
+    ON v2.visit_id = lv.visit_id
+  JOIN subsequent_visits v
+    ON v2.user_id = v.user_id
+  LEFT JOIN precomputed_taxonomy pt
+    ON pt.listing_id = lv.listing_id
+  WHERE lv._date > DATE_SUB(start_date, INTERVAL lookback_window DAY)
+    AND lv._date <= start_date
+),
+new_missions_per_user AS (
+  SELECT
+    v.variant_id,
+    v.user_id,
+    COUNT(DISTINCT CASE
+      WHEN recent.full_path IS NULL
+       AND rdl.clicked = 1
+      THEN pt.full_path
+    END) AS new_missions_started
+  FROM subsequent_visits v
+  -- experiment-period feed deliveries for the visits
+  LEFT JOIN `etsy-data-warehouse-prod.rollups.recsys_delivered_listings` rdl
+    ON rdl.visit_id = v.visit_id
+   AND rdl._date > start_date
+   AND rdl._date <= end_date
+   AND rdl.module_placement = module_placement_input
+  LEFT JOIN precomputed_taxonomy pt
+    ON pt.listing_id = rdl.listing_id
+  -- ensure user has recent activity window baked in
+  JOIN recent_user_taxos_seen recent_active
+    ON recent_active.user_id = v.user_id
+  LEFT JOIN recent_user_taxos_seen recent
+    ON recent.user_id = v.user_id
+   AND recent.full_path = pt.full_path
+  GROUP BY 1, 2
+),
+-- Limit to experiment users we bucketed 
+new_missions_stratified AS (
+  SELECT
+    us.search_decile_label,
+    us.feed_tercile_label,
+    nm.variant_id,
+    nm.user_id,
+    nm.new_missions_started
+  FROM new_missions_per_user nm
+  JOIN user_strata us
+    ON us.user_id = nm.user_id
+  WHERE nm.variant_id IN UNNEST(variants)
+),
+new_missions_agg AS (
+  SELECT
+    search_decile_label,
+    feed_tercile_label,
+    variant_id,
+    SUM(new_missions_started) AS sum_new_missions,
+    COUNT(DISTINCT user_id)    AS users_nm
+  FROM new_missions_stratified
+  GROUP BY 1, 2, 3
+),
+new_missions_pivoted AS (
+  SELECT
+    search_decile_label,
+    feed_tercile_label,
+    -- Control
+    SUM(IF(variant_id = 'off',        sum_new_missions, 0)) AS sum_nm_control,
+    SUM(IF(variant_id = 'off',        users_nm,        0)) AS users_nm_control,
+    -- Treatment
+    SUM(IF(variant_id = 'mule_sq_100', sum_new_missions, 0)) AS sum_nm_treatment,
+    SUM(IF(variant_id = 'mule_sq_100', users_nm,        0)) AS users_nm_treatment
+  FROM new_missions_agg
+  GROUP BY 1, 2
+)
+
+-- 6) Final output: CTRs + CTR lift and New Missions + New Missions lift
+SELECT
+  p.feed_tercile_label,
+  p.search_decile_label,
+
+  -- CTR metrics
+  p.users_control,
+  p.exposures_control,
+  SAFE_DIVIDE(p.clicks_control, NULLIF(p.exposures_control, 0)) AS ctr_control,
+
+  p.users_treatment,
+  p.exposures_treatment,
+  SAFE_DIVIDE(p.clicks_treatment, NULLIF(p.exposures_treatment, 0)) AS ctr_treatment,
+
+  SAFE_DIVIDE(
+    SAFE_DIVIDE(p.clicks_treatment, NULLIF(p.exposures_treatment, 0))
+    - SAFE_DIVIDE(p.clicks_control,   NULLIF(p.exposures_control,   0)),
+    NULLIF(SAFE_DIVIDE(p.clicks_control, NULLIF(p.exposures_control, 0)), 0)
+  ) AS ctr_lift_pct,
+
+  -- New missions metrics (per-user averages) and lifts
+  nm.users_nm_control,
+  SAFE_DIVIDE(nm.sum_nm_control, NULLIF(nm.users_nm_control, 0)) AS avg_new_missions_control,
+
+  nm.users_nm_treatment,
+  SAFE_DIVIDE(nm.sum_nm_treatment, NULLIF(nm.users_nm_treatment, 0)) AS avg_new_missions_treatment,
+
+  SAFE_DIVIDE(
+    SAFE_DIVIDE(nm.sum_nm_treatment, NULLIF(nm.users_nm_treatment, 0))
+    - SAFE_DIVIDE(nm.sum_nm_control,   NULLIF(nm.users_nm_control,   0)),
+    NULLIF(SAFE_DIVIDE(nm.sum_nm_control, NULLIF(nm.users_nm_control, 0)), 0)
+  ) AS new_missions_lift_pct,
+   SAFE_DIVIDE(s60.sum_searches_60d, NULLIF(s60.users_60d, 0)) AS avg_searches_60d_per_user
+
+FROM ctr_pivoted p
+LEFT JOIN new_missions_pivoted nm
+  USING (feed_tercile_label, search_decile_label)
+LEFT JOIN searches_60d_agg s60
+  USING (feed_tercile_label, search_decile_label)
+ORDER BY
+  feed_tercile_label, 
+  search_decile_label; 
