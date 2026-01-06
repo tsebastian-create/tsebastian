@@ -1,0 +1,223 @@
+DECLARE my_experiment STRING default 'boe_home/app_home.feed.genie_mvp.experiment_v5';
+DECLARE start_date DATE default '2025-12-06';
+DECLARE end_date DATE default '2025-12-10';
+DECLARE lookback_window INT64 DEFAULT 60;
+DECLARE module_placement_input STRING default 'boe_homescreen_feed';
+DECLARE bucketing_id_type INT64;
+
+SET bucketing_id_type = (
+  SELECT bucketing_id_type
+  FROM `etsy-data-warehouse-prod.catapult_unified.experiment`
+  WHERE _date = end_date
+    AND experiment_id = my_experiment
+);
+
+WITH ab_first_bucket_initial AS (
+  SELECT
+    bucketing_id,
+    bucketing_id_type,
+    variant_id,
+    MIN(bucketing_ts) AS bucketing_ts
+  FROM `etsy-data-warehouse-prod.catapult_unified.bucketing`
+  WHERE _date BETWEEN start_date AND end_date
+    -- Exclude Dec 9–10 bucketings
+    AND _date NOT IN (DATE '2025-12-09', DATE '2025-12-10')
+    AND experiment_id = my_experiment
+  GROUP BY bucketing_id, bucketing_id_type, variant_id
+),
+
+ab_first_bucket AS (
+  SELECT
+    b.bucketing_id,
+    b.variant_id,
+    COALESCE(MIN(f.event_ts), b.bucketing_ts) AS bucketing_ts
+  FROM ab_first_bucket_initial b
+  LEFT JOIN `etsy-data-warehouse-prod.catapult_unified.filtering_event` f
+    ON f.bucketing_id = b.bucketing_id
+    AND f._date BETWEEN start_date AND end_date
+    -- Exclude Dec 9–10 events
+    AND f._date NOT IN (DATE '2025-12-09', DATE '2025-12-10')
+    AND f.experiment_id = my_experiment
+    AND f.event_ts >= f.boundary_start_ts
+    AND f.event_ts >= b.bucketing_ts
+  GROUP BY 
+    b.bucketing_id, b.variant_id, b.bucketing_ts
+),
+
+subsequent_visits AS (
+  -- Browser-based experiments (bucketing_id_type = 1)
+  SELECT
+    b.bucketing_id,
+    b.variant_id,
+    v.visit_id,
+    v.user_id
+  FROM ab_first_bucket b
+  JOIN `etsy-data-warehouse-prod.weblog.visits` v
+    ON bucketing_id_type = 1 
+    AND b.bucketing_id = v.browser_id
+    AND TIMESTAMP_TRUNC(b.bucketing_ts, SECOND) <= v.end_datetime
+    AND v._date BETWEEN start_date AND end_date
+    -- Exclude Dec 9–10 visits
+    AND v._date NOT IN (DATE '2025-12-09', DATE '2025-12-10')
+
+  UNION ALL
+
+  -- User-based experiments (bucketing_id_type = 2)
+  SELECT
+    b.bucketing_id,
+    b.variant_id,
+    v.visit_id,
+    v.user_id
+  FROM ab_first_bucket b
+  JOIN `etsy-data-warehouse-prod.weblog.visits` v
+    ON bucketing_id_type = 2
+    AND b.bucketing_id = CAST(v.user_id AS STRING)
+    AND TIMESTAMP_TRUNC(b.bucketing_ts, SECOND) <= v.end_datetime
+    AND v._date BETWEEN start_date AND end_date
+    -- Exclude Dec 9–10 visits
+    AND v._date NOT IN (DATE '2025-12-09', DATE '2025-12-10')
+),
+
+precomputed_taxonomy AS (
+  SELECT
+    listing_id,
+    full_path,
+    REGEXP_EXTRACT(full_path, r'^[^.]*') AS l1,
+    REGEXP_EXTRACT(full_path, r'^[^.]*\.[^.]*') AS l2,
+    REGEXP_EXTRACT(full_path, r'^[^.]*\.[^.]*\.[^.]*') AS l3
+  FROM `etsy-data-warehouse-prod.materialized.listing_taxonomy`
+),
+
+recent_user_taxos_seen AS (
+  SELECT DISTINCT
+    v.user_id,
+    pt.l1,
+    pt.l2,
+    pt.l3,
+    pt.full_path
+  FROM `etsy-data-warehouse-prod.analytics.listing_views` lv
+  JOIN `etsy-data-warehouse-prod.visit_mart.visits` v2 
+    ON v2.visit_id = lv.visit_id
+  JOIN subsequent_visits v
+    ON v2.user_id = v.user_id
+  LEFT JOIN precomputed_taxonomy pt
+    ON pt.listing_id = lv.listing_id
+  WHERE lv._date > DATE_SUB(start_date, INTERVAL lookback_window DAY)
+    AND lv._date <= start_date
+),
+
+final_per_user AS (
+  SELECT 
+    v.variant_id,
+    v.user_id,
+    COUNT(DISTINCT CASE WHEN recent.full_path IS NULL AND rdl.clicked = 1 THEN pt.full_path END) AS distinct_full_path_new_clicked,
+    COUNT(DISTINCT CASE WHEN recent.full_path IS NULL AND rdl.seen = 1 THEN pt.full_path END) AS distinct_full_path_new_seen,
+    SAFE_DIVIDE(
+      COUNT(DISTINCT CASE WHEN recent.full_path IS NULL AND rdl.clicked = 1 THEN pt.full_path END), 
+      COUNT(DISTINCT CASE WHEN recent.full_path IS NULL AND rdl.seen = 1 THEN pt.full_path END)
+    ) AS distinct_full_path_new_ctr
+  FROM subsequent_visits v 
+  LEFT JOIN `etsy-data-warehouse-prod.rollups.recsys_delivered_listings` rdl
+    ON rdl.visit_id = v.visit_id
+    AND rdl._date > start_date
+    AND rdl._date <= end_date 
+    -- Exclude Dec 9–10 deliveries
+    AND rdl._date NOT IN (DATE '2025-12-09', DATE '2025-12-10')
+  LEFT JOIN precomputed_taxonomy pt
+    ON pt.listing_id = rdl.listing_id
+  JOIN recent_user_taxos_seen recent_active
+    ON recent_active.user_id = v.user_id
+  LEFT JOIN recent_user_taxos_seen recent
+    ON recent.user_id = v.user_id
+    AND recent.full_path = pt.full_path
+  --WHERE rdl.module_placement = module_placement_input
+  GROUP BY 1, 2
+),
+
+-- NEW: aggregate per variant for stats
+per_variant AS (
+  SELECT
+    variant_id,
+    COUNT(*) AS n_users,
+    AVG(distinct_full_path_new_seen) AS avg_new_seen_per_user,
+    AVG(distinct_full_path_new_clicked) AS avg_new_clicked_per_user,
+    AVG(distinct_full_path_new_ctr) AS avg_new_ctr_per_user,
+    STDDEV_POP(distinct_full_path_new_seen) AS sd_new_seen_per_user,
+    STDDEV_POP(distinct_full_path_new_clicked) AS sd_new_clicked_per_user,
+    STDDEV_POP(distinct_full_path_new_ctr) AS sd_new_ctr_per_user
+  FROM final_per_user
+  GROUP BY variant_id
+),
+
+control AS (
+  SELECT *
+  FROM per_variant
+  WHERE variant_id = 'off' -- control
+),
+
+variants AS (
+  SELECT *
+  FROM per_variant
+  WHERE variant_id != 'off' -- treatments
+)
+
+SELECT
+  v.variant_id,
+
+  -- counts
+  c.n_users AS control_users,
+  v.n_users AS variant_users,
+
+  -- avg distinct new missions clicked per user
+  c.avg_new_clicked_per_user AS control_avg_new_clicked_per_user,
+  v.avg_new_clicked_per_user AS variant_avg_new_clicked_per_user,
+  c.avg_new_seen_per_user as control_avg_new_seen_per_user,
+  v.avg_new_seen_per_user as variant_avg_new_seen_per_user,
+  SAFE_DIVIDE(
+    v.avg_new_clicked_per_user - c.avg_new_clicked_per_user,
+    c.avg_new_clicked_per_user
+  ) AS lift_new_clicked_per_user,
+  `etsy-data-warehouse-prod.functions.t_test_agg`(
+    v.n_users,
+    c.n_users,
+    v.avg_new_clicked_per_user,
+    c.avg_new_clicked_per_user,
+    v.sd_new_clicked_per_user,
+    c.sd_new_clicked_per_user
+  ).p_value AS pval_new_clicked_per_user,
+  `etsy-data-warehouse-prod.functions.power_two_means`(
+    v.n_users,
+    c.n_users,
+    v.avg_new_clicked_per_user - c.avg_new_clicked_per_user,
+    c.sd_new_clicked_per_user
+  ) AS power_new_clicked_per_user,
+
+  -- avg distinct new missions CTR per user
+  c.avg_new_ctr_per_user AS control_avg_new_ctr_per_user,
+  v.avg_new_ctr_per_user AS variant_avg_new_ctr_per_user,
+  SAFE_DIVIDE(
+    v.avg_new_ctr_per_user - c.avg_new_ctr_per_user,
+    c.avg_new_ctr_per_user
+  ) AS lift_new_ctr_per_user,
+  `etsy-data-warehouse-prod.functions.t_test_agg`(
+    v.n_users,
+    c.n_users,
+    v.avg_new_ctr_per_user,
+    c.avg_new_ctr_per_user,
+    v.sd_new_ctr_per_user,
+    c.sd_new_ctr_per_user
+  ).p_value AS pval_new_ctr_per_user,
+  `etsy-data-warehouse-prod.functions.power_two_means`(
+    v.n_users,
+    c.n_users,
+    v.avg_new_ctr_per_user - c.avg_new_ctr_per_user,
+    c.sd_new_ctr_per_user
+  ) AS power_new_ctr_per_user
+
+
+FROM
+  variants v
+CROSS JOIN
+  control c
+ORDER BY
+  v.variant_id;

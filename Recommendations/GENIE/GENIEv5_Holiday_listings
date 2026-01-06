@@ -1,0 +1,153 @@
+-------------------------------------------------------------
+
+-- GENIE v5 holiday vs non-holiday listing performance,
+-- aligned with Catapult window + outage exclusions.
+
+DECLARE config_flag_param STRING DEFAULT "boe_home/app_home.feed.genie_mvp.experiment_v5";
+
+DECLARE start_date DATE DEFAULT '2025-12-06';
+DECLARE end_date   DATE DEFAULT '2025-12-11';
+
+DECLARE module_placement_input STRING DEFAULT 'boe_homescreen_feed';
+
+DECLARE is_event_filtered BOOL;
+DECLARE bucketing_id_type INT64;
+
+-- If start/end not provided, pull from Catapult boundary (same pattern as your Catapult script)
+IF start_date IS NULL OR end_date IS NULL THEN
+  SET (start_date, end_date) = (
+    SELECT AS STRUCT
+      MAX(DATE(boundary_start_ts)) AS start_date,
+      MAX(_date)                   AS end_date
+    FROM `etsy-data-warehouse-prod.catapult_unified.experiment`
+    WHERE experiment_id = config_flag_param
+  );
+END IF;
+
+-- Pull event-filtering + bucketing type from Catapult
+IF is_event_filtered IS NULL THEN
+  SET (is_event_filtered, bucketing_id_type) = (
+    SELECT AS STRUCT
+      is_filtered,
+      bucketing_id_type
+    FROM `etsy-data-warehouse-prod.catapult_unified.experiment`
+    WHERE _date = end_date
+      AND experiment_id = config_flag_param
+  );
+ELSE
+  SET bucketing_id_type = (
+    SELECT
+      bucketing_id_type
+    FROM `etsy-data-warehouse-prod.catapult_unified.experiment`
+    WHERE _date = end_date
+      AND experiment_id = config_flag_param
+  );
+END IF;
+
+--------------------------------------------------------------------------------
+-- 1. First bucketing moment per experimental unit (using bucketing_period)
+--    Exclude units first bucketed on 2025-12-09 or 2025-12-10
+--------------------------------------------------------------------------------
+WITH ab_first_bucket AS (
+  SELECT
+    bucketing_id,
+    bucketing_id_type,
+    variant_id,
+    IF(is_event_filtered, filtered_bucketing_ts, bucketing_ts) AS bucketing_ts
+  FROM `etsy-data-warehouse-prod.catapult_unified.bucketing_period`
+  WHERE _date = end_date
+    AND experiment_id = config_flag_param
+    AND ((NOT is_event_filtered) OR (filtered_bucketing_ts IS NOT NULL))
+    AND DATE(IF(is_event_filtered, filtered_bucketing_ts, bucketing_ts))
+        NOT IN (DATE '2025-12-09', DATE '2025-12-10')
+),
+
+--------------------------------------------------------------------------------
+-- 2. Subsequent visits per variant (post-bucketing, non-affected days only)
+--------------------------------------------------------------------------------
+subsequent_visits AS (
+  -- Browser-based experiments
+  SELECT
+    b.bucketing_id,
+    b.variant_id,
+    v.visit_id
+  FROM ab_first_bucket b
+  JOIN `etsy-data-warehouse-prod.weblog.visits` v
+    ON bucketing_id_type = 1
+   AND b.bucketing_id = v.browser_id
+   AND TIMESTAMP_TRUNC(b.bucketing_ts, SECOND) <= v.end_datetime
+  WHERE v._date BETWEEN start_date AND end_date
+    AND v._date NOT IN (DATE '2025-12-09', DATE '2025-12-10')
+
+  UNION ALL
+
+  -- User-based experiments
+  SELECT
+    b.bucketing_id,
+    b.variant_id,
+    v.visit_id
+  FROM ab_first_bucket b
+  JOIN `etsy-data-warehouse-prod.weblog.visits` v
+    ON bucketing_id_type = 2
+   AND b.bucketing_id = CAST(v.user_id AS STRING)
+   AND TIMESTAMP_TRUNC(b.bucketing_ts, SECOND) <= v.end_datetime
+  WHERE v._date BETWEEN start_date AND end_date
+    AND v._date NOT IN (DATE '2025-12-09', DATE '2025-12-10')
+),
+
+--------------------------------------------------------------------------------
+-- 3. Join to recs delivered listings + listing entities, define holiday_flag
+--------------------------------------------------------------------------------
+feed_events AS (
+  SELECT
+    v.variant_id,
+    rdl.listing_id,
+    rdl.seen,
+    rdl.clicked,
+    rdl.purchased_after_view,
+    le.normalized_occasion
+  FROM subsequent_visits v
+  JOIN `etsy-data-warehouse-prod.rollups.recsys_delivered_listings` rdl
+    USING (visit_id)
+  LEFT JOIN `etsy-data-warehouse-prod.inventory_ml.listing_entities_normalized_latest` le
+    USING (listing_id)
+  WHERE rdl.module_placement = module_placement_input
+    AND rdl._date BETWEEN start_date AND end_date
+    AND rdl._date NOT IN (DATE '2025-12-09', DATE '2025-12-10')
+),
+
+feed_events_enriched AS (
+  SELECT
+    variant_id,
+    listing_id,
+    seen,
+    clicked,
+    purchased_after_view,
+    normalized_occasion[SAFE_OFFSET(0)] AS listing_occasion,
+    CASE
+      WHEN LOWER(normalized_occasion[SAFE_OFFSET(0)]) LIKE ANY (
+        '%x%mas%', '%holiday%', '%christmas%', '%hannukah%', '%new year%',
+        '%kwanza%', '%wonderland%', '%winter%', '%end of year%', '%yule%',
+        '%santa%', '%white%elephant%', '%chanukah%', '%boxing%day%'
+      )
+      THEN 'holiday'
+      ELSE 'non_holiday'
+    END AS holiday_flag
+  FROM feed_events
+)
+
+--------------------------------------------------------------------------------
+-- 4. Aggregate by variant + holiday/non-holiday
+--------------------------------------------------------------------------------
+SELECT
+  variant_id,
+  holiday_flag,
+  COUNT(*) AS listings_delivered,
+  COUNTIF(seen = 1) AS listings_seen,
+  COUNTIF(clicked = 1) AS listings_clicked,
+  COUNTIF(purchased_after_view = 1) AS listings_purchased,
+  SAFE_DIVIDE(COUNTIF(clicked = 1), COUNTIF(seen = 1)) AS ctr_seen,
+  SAFE_DIVIDE(COUNTIF(purchased_after_view = 1), COUNTIF(seen = 1)) AS purchase_rate_seen
+FROM feed_events_enriched
+GROUP BY 1, 2
+ORDER BY 1, 2;

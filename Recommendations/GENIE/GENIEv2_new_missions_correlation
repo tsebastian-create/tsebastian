@@ -1,0 +1,514 @@
+DECLARE my_experiment STRING default 'boe_home/app_home.feed.genie_mvp.experiment_v2';
+DECLARE start_date DATE default '2025-11-14';
+DECLARE end_date DATE default '2025-11-23';
+DECLARE lookback_window INT64 DEFAULT 60;
+DECLARE module_placement_input STRING default 'boe_homescreen_feed';
+DECLARE bucketing_id_type INT64;
+
+SET bucketing_id_type = (
+  SELECT bucketing_id_type
+  FROM `etsy-data-warehouse-prod.catapult_unified.experiment`
+  WHERE _date = end_date
+    AND experiment_id = my_experiment
+);
+
+
+CREATE OR REPLACE TABLE `etsy-data-warehouse-dev.tsebastian.geniev2_per_user_with_bin`
+-- OPTIONS(expiration_timestamp = current_timestamp + interval 14 day ) 
+AS (
+WITH ab_first_bucket_initial AS (
+  SELECT
+    bucketing_id,
+    bucketing_id_type,
+    variant_id,
+    MIN(bucketing_ts) AS bucketing_ts,
+  FROM `etsy-data-warehouse-prod.catapult_unified.bucketing`
+  WHERE _date BETWEEN start_date AND end_date
+    AND experiment_id = my_experiment
+  GROUP BY bucketing_id, bucketing_id_type, variant_id
+),
+
+ab_first_bucket AS (
+  SELECT
+    b.bucketing_id,
+    b.variant_id,
+    COALESCE(MIN(f.event_ts), b.bucketing_ts) AS bucketing_ts
+  FROM ab_first_bucket_initial b
+  LEFT JOIN `etsy-data-warehouse-prod.catapult_unified.filtering_event` f
+    ON f.bucketing_id = b.bucketing_id
+    AND f._date BETWEEN start_date AND end_date
+    AND f.experiment_id = my_experiment
+    AND f.event_ts >= f.boundary_start_ts
+    AND f.event_ts >= b.bucketing_ts
+  GROUP BY 
+    b.bucketing_id, b.variant_id, b.bucketing_ts
+),
+
+subsequent_visits AS (
+ 
+  -- User-based experiments (bucketing_id_type = 2)
+  SELECT
+    b.bucketing_id,
+    b.variant_id,
+    v.visit_id,
+    v.user_id
+  FROM ab_first_bucket b
+  JOIN `etsy-data-warehouse-prod.weblog.visits` v
+    ON bucketing_id_type = 2
+    AND b.bucketing_id = CAST(v.user_id AS STRING)
+    AND TIMESTAMP_TRUNC(b.bucketing_ts, SECOND) <= v.end_datetime
+    and v._date BETWEEN start_date AND end_date
+),
+
+precomputed_taxonomy AS (
+  SELECT
+    listing_id,
+    full_path,
+    REGEXP_EXTRACT(full_path, r'^[^.]*') AS l1,
+    REGEXP_EXTRACT(full_path, r'^[^.]*\.[^.]*') AS l2,
+    REGEXP_EXTRACT(full_path, r'^[^.]*\.[^.]*\.[^.]*') AS l3,
+    ftg.group_id
+  FROM `etsy-data-warehouse-prod.materialized.listing_taxonomy` lt
+  LEFT JOIN `etsy-data-warehouse-dev.ganand.frozen_taxo_groups` ftg
+    ON ftg.taxo_id = lt.taxonomy_id
+),
+
+recent_user_taxos_seen AS (
+  SELECT DISTINCT
+    v.user_id,
+    pt.l1,
+    pt.l2,
+    pt.l3,
+    pt.full_path,
+    pt.group_id
+  FROM `etsy-data-warehouse-prod.analytics.listing_views` lv
+  JOIN `etsy-data-warehouse-prod.visit_mart.visits` v2 
+    ON v2.visit_id = lv.visit_id
+  JOIN subsequent_visits v
+    ON v2.user_id = v.user_id
+  LEFT JOIN precomputed_taxonomy pt
+    ON pt.listing_id = lv.listing_id
+  WHERE lv._date > DATE_SUB(start_date, INTERVAL lookback_window DAY)
+    AND lv._date <= start_date
+),
+
+final_per_user AS (
+  SELECT 
+    v.variant_id,
+    v.user_id,
+    COUNT(DISTINCT CASE WHEN recent.full_path IS NULL AND rdl.clicked = 1 THEN pt.full_path END) AS distinct_full_path_new_clicked,
+    COUNT(DISTINCT CASE WHEN recent.full_path IS NULL AND rdl.seen = 1 THEN pt.full_path END) AS distinct_full_path_new_seen,
+    SAFE_DIVIDE(COUNT(DISTINCT CASE WHEN recent.full_path IS NULL AND rdl.clicked = 1 THEN pt.full_path END), 
+                COUNT(DISTINCT CASE WHEN recent.full_path IS NULL AND rdl.seen = 1 THEN pt.full_path END)) AS distinct_full_path_new_ctr,
+
+    -- GROUP-ID (co-click cluster) based new missions
+    COUNT(DISTINCT CASE WHEN pt.group_id IS NOT NULL AND recent_group.group_id IS NULL AND rdl.clicked = 1 THEN pt.group_id END) AS distinct_group_new_clicked,
+    COUNT(DISTINCT CASE  WHEN pt.group_id IS NOT NULL AND recent_group.group_id IS NULL AND rdl.seen = 1 THEN pt.group_id END) AS distinct_group_new_seen,
+    SAFE_DIVIDE( COUNT(DISTINCT CASE WHEN pt.group_id IS NOT NULL AND recent_group.group_id IS NULL AND rdl.clicked = 1 THEN pt.group_id END),
+      COUNT(DISTINCT CASE WHEN pt.group_id IS NOT NULL AND recent_group.group_id IS NULL AND rdl.seen = 1 THEN pt.group_id END)) AS distinct_group_new_ctr
+
+  FROM subsequent_visits v 
+  LEFT JOIN `etsy-data-warehouse-prod.rollups.recsys_delivered_listings` rdl
+    ON rdl.visit_id = v.visit_id
+    AND rdl._date > start_date
+    AND rdl._date <= end_date 
+  LEFT JOIN precomputed_taxonomy pt
+    ON pt.listing_id = rdl.listing_id
+  JOIN recent_user_taxos_seen recent_active
+    ON recent_active.user_id = v.user_id
+  LEFT JOIN recent_user_taxos_seen recent
+    ON recent.user_id = v.user_id
+    AND recent.full_path = pt.full_path
+
+  LEFT JOIN recent_user_taxos_seen recent_group
+    ON recent_group.user_id = v.user_id
+   AND recent_group.group_id = pt.group_id
+
+  WHERE rdl.module_placement = module_placement_input   -- boe feed only
+  GROUP BY 1, 2
+)
+, purchases_next_30d AS (
+  -- Purchases per user in the 30 days after  bucketing ts
+
+  SELECT
+    a.buyer_user_id AS user_id,
+    COUNT(DISTINCT a.transaction_id) AS purchases_next_30d
+  FROM `etsy-data-warehouse-prod.transaction_mart.all_transactions` a
+  JOIN ab_first_bucket b on CAST(a.buyer_user_id as string) = b.bucketing_id
+  WHERE
+    a.date >= date(b.bucketing_ts)
+    AND a.date < DATE_ADD(date(b.bucketing_ts), INTERVAL 30 DAY)
+  GROUP BY 1
+)
+  -- Attach 30d purchases
+  SELECT
+    f.variant_id,
+    f.user_id,
+  -- full path-based metrics   
+    f.distinct_full_path_new_clicked,
+    f.distinct_full_path_new_seen,
+
+ -- group-based metrics
+    f.distinct_group_new_clicked,
+    f.distinct_group_new_seen,
+    
+-- Bin distinct new missions clicked
+    CASE WHEN  distinct_full_path_new_clicked between 0 and 9 THEN distinct_full_path_new_clicked
+      ELSE 10 END AS new_missions_clicked_bin,
+    CASE WHEN distinct_group_new_clicked BETWEEN 0 AND 9 THEN distinct_group_new_clicked
+    ELSE 10 END AS new_missions_clicked_bin_group,
+
+
+    IFNULL(p.purchases_next_30d, 0) AS purchases_next_30d
+  FROM final_per_user f
+  LEFT JOIN purchases_next_30d p
+    ON p.user_id = f.user_id
+);
+
+
+
+-- 1) Binned new missions clicked vs purchases_next_30d, per variant
+SELECT
+  variant_id,
+  new_missions_clicked_bin,
+  COUNT(*) AS n_users,
+  AVG(purchases_next_30d) AS avg_purchases_next_30d,
+  SUM(purchases_next_30d) AS total_purchases_next_30d
+FROM  `etsy-data-warehouse-dev.tsebastian.geniev2_per_user_with_bin`
+GROUP BY 1, 2
+ORDER BY 1, 2;
+
+-- group
+SELECT
+  variant_id,
+  new_missions_clicked_bin_group,
+  COUNT(*) AS n_users,
+  AVG(purchases_next_30d) AS avg_purchases_next_30d
+FROM `etsy-data-warehouse-dev.tsebastian.geniev2_per_user_with_bin`
+GROUP BY 1, 2
+ORDER BY 1, 2;
+
+
+-- 2) correlations
+
+-- full path
+select corr(distinct_full_path_new_clicked, purchases_next_30d) as corr_full_path,
+ corr(distinct_group_new_clicked, purchases_next_30d) as corr_group
+from `etsy-data-warehouse-dev.tsebastian.geniev2_per_user_with_bin`
+;
+
+-- group
+select corr(distinct_full_path_new_clicked/NULLIF(distinct_full_path_new_seen,0), purchases_next_30d) as corr_full_path,
+ corr(distinct_group_new_clicked/NULLIF(distinct_group_new_seen,0), purchases_next_30d) as corr_group
+from `etsy-data-warehouse-dev.tsebastian.geniev2_per_user_with_bin`
+where distinct_group_new_clicked > 0 and distinct_group_new_seen > 0
+;
+
+-- full path CTR
+WITH per_user_with_ctr AS (
+  SELECT
+    variant_id,
+    user_id,
+    SAFE_DIVIDE( distinct_group_new_clicked, distinct_group_new_seen ) AS group_new_mission_ctr,
+    purchases_next_30d
+  FROM `etsy-data-warehouse-dev.tsebastian.geniev2_per_user_with_bin`
+  WHERE distinct_group_new_seen > 0 and distinct_group_new_clicked >0
+),
+
+per_user_with_ctr_decile AS (
+  SELECT    *,  NTILE(10) OVER (ORDER BY group_new_mission_ctr) AS new_missions_ctr_bin_group
+  FROM per_user_with_ctr
+)
+
+SELECT
+  variant_id,
+  new_missions_ctr_bin_group,
+  COUNT(*) AS n_users,
+  AVG(group_new_mission_ctr) AS avg_group_new_mission_ctr,
+  AVG(purchases_next_30d) AS avg_purchases_next_30d,
+
+FROM per_user_with_ctr_decile
+GROUP BY 1, 2
+ORDER BY 1, 2;
+
+-- group CTR
+WITH per_user_with_ctr AS (
+  SELECT
+    variant_id,
+    user_id,
+    SAFE_DIVIDE( distinct_full_path_new_clicked, distinct_full_path_new_seen ) AS full_path_new_mission_ctr,
+    purchases_next_30d
+  FROM `etsy-data-warehouse-dev.tsebastian.geniev2_per_user_with_bin`
+  WHERE distinct_full_path_new_seen > 0 and distinct_full_path_new_clicked >0
+),
+
+per_user_with_ctr_decile AS (
+  SELECT    *,  NTILE(10) OVER (ORDER BY full_path_new_mission_ctr) AS new_missions_ctr_bin_full_path
+  FROM per_user_with_ctr 
+)
+
+SELECT
+  variant_id,
+  new_missions_ctr_bin_full_path,
+  COUNT(*) AS n_users,
+  AVG(full_path_new_mission_ctr) AS avg_full_path_new_mission_ctr,
+  AVG(purchases_next_30d) AS avg_purchases_next_30d,
+
+FROM per_user_with_ctr_decile
+GROUP BY 1, 2
+ORDER BY 1, 2;
+
+
+-------- adding normalization by listings clicked ---------
+
+
+-- -- PARAMETERS
+-- DECLARE my_experiment STRING DEFAULT 'boe_home/app_home.feed.genie_mvp.experiment_v2';
+-- DECLARE start_date DATE   DEFAULT '2025-11-14';
+-- DECLARE end_date   DATE   DEFAULT '2025-11-23';
+-- DECLARE lookback_window INT64 DEFAULT 60;
+-- DECLARE module_placement_input STRING DEFAULT 'boe_homescreen_feed';
+-- DECLARE bucketing_id_type INT64;
+
+-- SET bucketing_id_type = (
+--   SELECT bucketing_id_type
+--   FROM `etsy-data-warehouse-prod.catapult_unified.experiment`
+--   WHERE _date = end_date
+--     AND experiment_id = my_experiment
+-- );
+
+-- -- ====================================================================
+-- -- 1) BUILD PER-USER METRICS TABLE (includes all normalizations)
+-- -- ====================================================================
+-- CREATE OR REPLACE TABLE `etsy-data-warehouse-dev.tsebastian.geniev2_per_user_metrics`
+-- OPTIONS (
+--   expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 14 DAY)
+-- ) AS
+-- WITH
+-- -- First bucketing moment per experimental unit
+-- ab_first_bucket_initial AS (
+--   SELECT
+--     bucketing_id,
+--     bucketing_id_type,
+--     variant_id,
+--     MIN(bucketing_ts) AS bucketing_ts
+--   FROM `etsy-data-warehouse-prod.catapult_unified.bucketing`
+--   WHERE _date BETWEEN start_date AND end_date
+--     AND experiment_id = my_experiment
+--   GROUP BY bucketing_id, bucketing_id_type, variant_id
+-- ),
+
+-- ab_first_bucket AS (
+--   SELECT
+--     b.bucketing_id,
+--     b.bucketing_id_type,
+--     b.variant_id,
+--     COALESCE(MIN(f.event_ts), b.bucketing_ts) AS bucketing_ts
+--   FROM ab_first_bucket_initial b
+--   LEFT JOIN `etsy-data-warehouse-prod.catapult_unified.filtering_event` f
+--     ON f.bucketing_id = b.bucketing_id
+--     AND f._date BETWEEN start_date AND end_date
+--     AND f.experiment_id = my_experiment
+--     AND f.event_ts >= f.boundary_start_ts
+--     AND f.event_ts >= b.bucketing_ts
+--   GROUP BY
+--     b.bucketing_id, b.bucketing_id_type, b.variant_id, b.bucketing_ts
+-- ),
+
+-- -- Visits after bucketing (browser- or user-based)
+-- subsequent_visits AS (
+--   -- Browser-based experiments (bucketing_id_type = 1)
+--   SELECT
+--     b.bucketing_id,
+--     b.variant_id,
+--     v.visit_id,
+--     v.user_id
+--   FROM ab_first_bucket b
+--   JOIN `etsy-data-warehouse-prod.weblog.visits` v
+--     ON bucketing_id_type = 1
+--    AND b.bucketing_id = v.browser_id
+--    AND TIMESTAMP_TRUNC(b.bucketing_ts, SECOND) <= v.end_datetime
+--    AND v._date BETWEEN start_date AND end_date
+
+--   UNION ALL
+
+--   -- User-based experiments (bucketing_id_type = 2)
+--   SELECT
+--     b.bucketing_id,
+--     b.variant_id,
+--     v.visit_id,
+--     v.user_id
+--   FROM ab_first_bucket b
+--   JOIN `etsy-data-warehouse-prod.weblog.visits` v
+--     ON bucketing_id_type = 2
+--    AND b.bucketing_id = CAST(v.user_id AS STRING)
+--    AND TIMESTAMP_TRUNC(b.bucketing_ts, SECOND) <= v.end_datetime
+--    AND v._date BETWEEN start_date AND end_date
+-- ),
+
+-- -- Taxonomy + co-click group mapping per listing
+-- precomputed_taxonomy AS (
+--   SELECT
+--     lt.listing_id,
+--     lt.full_path,
+--     REGEXP_EXTRACT(lt.full_path, r'^[^.]*') AS l1,
+--     REGEXP_EXTRACT(lt.full_path, r'^[^.]*\.[^.]*') AS l2,
+--     REGEXP_EXTRACT(lt.full_path, r'^[^.]*\.[^.]*\.[^.]*') AS l3,
+
+--   FROM `etsy-data-warehouse-prod.materialized.listing_taxonomy` lt
+
+-- ),
+
+-- -- User's recent taxonomies seen (lookback window) including group_id
+-- recent_user_taxos_seen AS (
+--   SELECT DISTINCT
+--     v.user_id,
+--     pt.l1,
+--     pt.l2,
+--     pt.l3,
+--     pt.full_path,
+
+--   FROM `etsy-data-warehouse-prod.analytics.listing_views` lv
+--   JOIN `etsy-data-warehouse-prod.visit_mart.visits` v2
+--     ON v2.visit_id = lv.visit_id
+--   JOIN subsequent_visits v
+--     ON v2.user_id = v.user_id
+--   LEFT JOIN precomputed_taxonomy pt
+--     ON pt.listing_id = lv.listing_id
+--   WHERE lv._date > DATE_SUB(start_date, INTERVAL lookback_window DAY)
+--     AND lv._date <= start_date
+-- ),
+
+-- -- Per-user foresight metrics (full-path + group-based) and total recs clicked
+-- final_per_user AS (
+--   SELECT
+--     v.variant_id,
+--     v.user_id,
+
+--     -- FULL-PATH based new missions
+--     COUNT(DISTINCT CASE
+--       WHEN recent_fp.full_path IS NULL AND rdl.clicked = 1 THEN pt.full_path
+--     END) AS distinct_full_path_new_clicked,
+
+--     COUNT(DISTINCT CASE
+--       WHEN recent_fp.full_path IS NULL AND rdl.seen = 1 THEN pt.full_path
+--     END) AS distinct_full_path_new_seen,
+
+--     SAFE_DIVIDE(
+--       COUNT(DISTINCT CASE
+--         WHEN recent_fp.full_path IS NULL AND rdl.clicked = 1 THEN pt.full_path
+--       END),
+--       COUNT(DISTINCT CASE
+--         WHEN recent_fp.full_path IS NULL AND rdl.seen = 1 THEN pt.full_path
+--       END)
+--     ) AS distinct_full_path_new_ctr,
+
+
+--     -- Denominator: all BOE feed recs clicked per user
+--     COUNT(DISTINCT CASE
+--       WHEN rdl.clicked = 1 THEN rdl.listing_id
+--     END) AS total_recs_clicked
+
+--   FROM subsequent_visits v
+--   LEFT JOIN `etsy-data-warehouse-prod.rollups.recsys_delivered_listings` rdl
+--     ON rdl.visit_id = v.visit_id
+--    AND rdl._date > start_date
+--    AND rdl._date <= end_date
+--   LEFT JOIN precomputed_taxonomy pt
+--     ON pt.listing_id = rdl.listing_id
+--   JOIN recent_user_taxos_seen recent_active
+--     ON recent_active.user_id = v.user_id
+--   LEFT JOIN recent_user_taxos_seen recent_fp
+--     ON recent_fp.user_id = v.user_id
+--    AND recent_fp.full_path = pt.full_path
+
+--   WHERE rdl.module_placement = module_placement_input -- BOE feed only
+--   GROUP BY 1, 2
+-- ),
+
+-- -- Purchases per user in the 30 days after the experiment end_date
+-- -- (simple global window; good enough for correlation work)
+-- purchases_next_30d AS (
+--   SELECT
+--     a.buyer_user_id AS user_id,
+--     COUNT(DISTINCT a.transaction_id) AS purchases_next_30d
+--   FROM `etsy-data-warehouse-prod.transaction_mart.all_transactions` a
+--   WHERE a.date >= end_date
+--     AND a.date < DATE_ADD(end_date, INTERVAL 30 DAY)
+--   GROUP BY 1
+-- ),
+
+-- -- Attach purchases + derived normalizations
+-- per_user_metrics AS (
+--   SELECT
+--     f.variant_id,
+--     f.user_id,
+
+--     -- Full-path metrics
+--     f.distinct_full_path_new_clicked,
+--     f.distinct_full_path_new_seen,
+--     f.distinct_full_path_new_ctr,
+
+--     -- All recs clicked
+--     f.total_recs_clicked,
+--     IFNULL(p.purchases_next_30d, 0) AS purchases_next_30d
+
+--   FROM final_per_user f
+--   LEFT JOIN purchases_next_30d p
+--     ON p.user_id = f.user_id
+-- )
+
+-- SELECT *
+-- FROM per_user_metrics
+-- ;
+
+-- -- ====================================================================
+-- -- 2) ANALYSIS QUERIES FOR SHEETS / PLOTS
+-- -- ====================================================================
+
+-- -- --------------------------------------------------------------------
+-- -- 2.1 normalized Full-path new missions   vs 30-day purchases
+-- -- --------------------------------------------------------------------
+-- -- Deciles of "share of all rec clicks that are FULL-PATH new missions"
+-- -- vs. average purchases in the next 30 days
+
+-- WITH per_user AS (
+--   SELECT
+--     variant_id,
+--     user_id,
+--     distinct_full_path_new_clicked,
+--     total_recs_clicked,
+--     purchases_next_30d
+--   FROM `etsy-data-warehouse-dev.tsebastian.geniev2_per_user_metrics`
+--   WHERE total_recs_clicked > 0 and   distinct_full_path_new_clicked>0       -- need a non-zero denominator
+-- ),
+
+-- per_user_with_share AS (
+--   SELECT
+--     *,
+--     SAFE_DIVIDE(
+--       distinct_full_path_new_clicked,
+--       NULLIF(total_recs_clicked, 0)
+--     ) AS full_path_new_click_share
+--   FROM per_user
+-- ),
+
+-- per_user_with_decile AS (
+--   SELECT
+--     *,
+--     -- Global deciles across all users. 
+--     NTILE(10) OVER (ORDER BY full_path_new_click_share)
+--       AS full_path_new_click_share_decile
+--   FROM per_user_with_share
+-- )
+
+-- SELECT
+--   variant_id,
+--   full_path_new_click_share_decile,
+--   COUNT(*) AS n_users,
+--   AVG(full_path_new_click_share) AS avg_full_path_new_click_share,
+--   AVG(purchases_next_30d) AS avg_purchases_next_30d,
+--   SUM(purchases_next_30d) AS total_purchases_next_30d
+-- FROM per_user_with_decile
+-- GROUP BY 1, 2
+-- ORDER BY 1, 2;
