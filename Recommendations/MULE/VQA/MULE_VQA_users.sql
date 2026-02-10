@@ -1,4 +1,4 @@
-##### 30 days lookback ######
+##### 30 days lookback #####
 
 -- DECLARE lookback_days INT64 DEFAULT 30;
 DECLARE start_date DATE DEFAULT '2025-12-29';
