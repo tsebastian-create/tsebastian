@@ -12,8 +12,7 @@ SET bucketing_id_type = (
     AND experiment_id = my_experiment
 );
 
-
-CREATE or replace  TABLE  `etsy-data-warehouse-dev.tsebastian.genie_v2_newmissions`  AS
+CREATE OR REPLACE TABLE `etsy-data-warehouse-dev.tsebastian.genie_v2_newmissions` AS
 WITH ab_first_bucket_initial AS (
   SELECT
     bucketing_id,
@@ -108,34 +107,34 @@ final_per_user AS (
     -- L2 "new missions" (v1.5)
     COUNT(DISTINCT CASE
       WHEN pt.l2 IS NOT NULL
-        AND recent_l2.l2 IS NULL
-        AND rdl.clicked = 1
+       AND recent_l2.l2 IS NULL
+       AND rdl.clicked = 1
       THEN pt.l2 END
     ) AS distinct_l2_new_clicked,
 
     COUNT(DISTINCT CASE
       WHEN pt.l2 IS NOT NULL
-        AND recent_l2.l2 IS NULL
-        AND rdl.seen = 1
+       AND recent_l2.l2 IS NULL
+       AND rdl.seen = 1
       THEN pt.l2 END
     ) AS distinct_l2_new_seen,
 
     SAFE_DIVIDE(
       COUNT(DISTINCT CASE
         WHEN pt.l2 IS NOT NULL
-          AND recent_l2.l2 IS NULL
-          AND rdl.clicked = 1
+         AND recent_l2.l2 IS NULL
+         AND rdl.clicked = 1
         THEN pt.l2 END
       ),
       COUNT(DISTINCT CASE
         WHEN pt.l2 IS NOT NULL
-          AND recent_l2.l2 IS NULL
-          AND rdl.seen = 1
+         AND recent_l2.l2 IS NULL
+         AND rdl.seen = 1
         THEN pt.l2 END
       )
     ) AS distinct_l2_new_ctr,
 
-    -- All L2 missions (not just new) – optional diagnostics
+    -- All L2 missions (diagnostics)
     COUNT(DISTINCT CASE
       WHEN rdl.clicked = 1 THEN pt.l2 END
     ) AS distinct_l2_all_clicked,
@@ -151,7 +150,29 @@ final_per_user AS (
       COUNT(DISTINCT CASE
         WHEN rdl.seen = 1 THEN pt.l2 END
       )
-    ) AS distinct_l2_all_ctr
+    ) AS distinct_l2_all_ctr,
+
+    -- Listing-level: total clicks & new-mission clicks per user
+    SUM(CASE WHEN rdl.clicked = 1 THEN 1 ELSE 0 END)
+      AS total_clicks_user,
+
+    SUM(CASE
+          WHEN rdl.clicked = 1
+           AND pt.l2 IS NOT NULL
+           AND recent_l2.l2 IS NULL
+        THEN 1 ELSE 0 END
+    ) AS new_mission_clicks_user,
+
+    -- Listing-level: total impressions & new-mission impressions per user
+    SUM(CASE WHEN rdl.seen = 1 THEN 1 ELSE 0 END)
+      AS total_impressions_user,
+
+    SUM(CASE
+          WHEN rdl.seen = 1
+           AND pt.l2 IS NOT NULL
+           AND recent_l2.l2 IS NULL
+        THEN 1 ELSE 0 END
+    ) AS new_mission_impressions_user
 
   FROM subsequent_visits v
   LEFT JOIN `etsy-data-warehouse-prod.rollups.recsys_delivered_listings` rdl
@@ -176,21 +197,58 @@ per_variant AS (
     variant_id,
     COUNT(*) AS n_users,
 
-    -- L2 new missions (v1.5)
-    AVG(distinct_l2_new_seen)    AS avg_new_seen_per_user,
-    AVG(distinct_l2_new_clicked) AS avg_new_clicked_per_user,
-    AVG(distinct_l2_new_ctr)     AS avg_new_ctr_per_user,
+    -- Existing L2 new missions metrics
+    AVG(distinct_l2_new_seen)        AS avg_new_seen_per_user,
+    AVG(distinct_l2_new_clicked)     AS avg_new_clicked_per_user,
+    AVG(distinct_l2_new_ctr)        AS avg_new_ctr_per_user,
     STDDEV(distinct_l2_new_seen)    AS sd_new_seen_per_user,
     STDDEV(distinct_l2_new_clicked) AS sd_new_clicked_per_user,
     STDDEV(distinct_l2_new_ctr)     AS sd_new_ctr_per_user,
 
-    -- All L2 missions (diagnostics)
-    AVG(distinct_l2_all_seen)    AS avg_all_seen_per_user,
-    AVG(distinct_l2_all_clicked) AS avg_all_clicked_per_user,
-    AVG(distinct_l2_all_ctr)     AS avg_all_ctr_per_user,
+    -- Existing all L2 metrics (diagnostics)
+    AVG(distinct_l2_all_seen)       AS avg_all_seen_per_user,
+    AVG(distinct_l2_all_clicked)    AS avg_all_clicked_per_user,
+    AVG(distinct_l2_all_ctr)        AS avg_all_ctr_per_user,
     STDDEV(distinct_l2_all_seen)    AS sd_all_seen_per_user,
     STDDEV(distinct_l2_all_clicked) AS sd_all_clicked_per_user,
-    STDDEV(distinct_l2_all_ctr)     AS sd_all_ctr_per_user
+    STDDEV(distinct_l2_all_ctr)     AS sd_all_ctr_per_user,
+
+    --------------------------------------------------------------------
+    -- 1) User-level share of DISTINCT new L2s among all distinct L2s
+    --------------------------------------------------------------------
+    AVG(
+      SAFE_DIVIDE(
+        distinct_l2_new_clicked,
+        NULLIF(distinct_l2_all_clicked, 0)
+      )
+    ) AS avg_share_distinct_new_L2_clicked_per_user,
+
+    AVG(
+      SAFE_DIVIDE(
+        distinct_l2_new_seen,
+        NULLIF(distinct_l2_all_seen, 0)
+      )
+    ) AS avg_share_distinct_new_L2_seen_per_user,
+
+    --------------------------------------------------------------------
+    -- 2) User-level share of new-mission listing clicks among all clicks
+    --------------------------------------------------------------------
+    AVG(
+      SAFE_DIVIDE(
+        new_mission_clicks_user,
+        NULLIF(total_clicks_user, 0)
+      )
+    ) AS avg_share_new_mission_clicks_per_user,
+
+    --------------------------------------------------------------------
+    -- 3) User-level share of new-mission impressions among all impressions
+    --------------------------------------------------------------------
+    AVG(
+      SAFE_DIVIDE(
+        new_mission_impressions_user,
+        NULLIF(total_impressions_user, 0)
+      )
+    ) AS avg_share_new_mission_impressions_per_user
 
   FROM final_per_user
   GROUP BY variant_id
@@ -216,10 +274,10 @@ SELECT
   v.n_users AS variant_users,
 
   -- avg distinct new L2 missions clicked per user (v1.5)
-  c.avg_new_clicked_per_user AS control_avg_new_clicked_per_user,
-  v.avg_new_clicked_per_user AS variant_avg_new_clicked_per_user,
-  c.avg_new_seen_per_user    AS control_avg_new_seen_per_user,
-  v.avg_new_seen_per_user    AS variant_avg_new_seen_per_user,
+  c.avg_new_clicked_per_user    AS control_avg_new_clicked_per_user,
+  v.avg_new_clicked_per_user    AS variant_avg_new_clicked_per_user,
+  c.avg_new_seen_per_user       AS control_avg_new_seen_per_user,
+  v.avg_new_seen_per_user       AS variant_avg_new_seen_per_user,
 
   SAFE_DIVIDE(
     v.avg_new_clicked_per_user - c.avg_new_clicked_per_user,
@@ -246,14 +304,14 @@ SELECT
   (
     SELECT
       MIN(k * (DATE_DIFF(end_date, start_date, DAY) + 1))
-      - (DATE_DIFF(end_date, start_date, DAY) + 1)
+        - (DATE_DIFF(end_date, start_date, DAY) + 1)
     FROM UNNEST(GENERATE_ARRAY(1, 20)) AS k
     WHERE `etsy-data-warehouse-prod.functions.power_two_means`(
-            k * v.n_users,
-            k * c.n_users,
-            v.avg_new_clicked_per_user - c.avg_new_clicked_per_user,
-            c.sd_new_clicked_per_user
-          ) >= 0.8
+      k * v.n_users,
+      k * c.n_users,
+      v.avg_new_clicked_per_user - c.avg_new_clicked_per_user,
+      c.sd_new_clicked_per_user
+    ) >= 0.8
   ) AS est_additional_days_to_power_new_clicked_per_user,
 
   -- avg distinct new L2 missions CTR per user
@@ -265,21 +323,61 @@ SELECT
     c.avg_new_ctr_per_user
   ) AS lift_new_ctr_per_user,
 
-  `etsy-data-warehouse-prod.functions.t_test_agg`(
-    v.n_users,
-    c.n_users,
-    v.avg_new_ctr_per_user,
-    c.avg_new_ctr_per_user,
-    v.sd_new_ctr_per_user,
-    c.sd_new_ctr_per_user
-  ).p_value AS pval_new_ctr_per_user,
+  -- `etsy-data-warehouse-prod.functions.t_test_agg`(
+  --   v.n_users,
+  --   c.n_users,
+  --   v.avg_new_ctr_per_user,
+  --   c.avg_new_ctr_per_user,
+  --   v.sd_new_ctr_per_user,
+  --   c.sd_new_ctr_per_user
+  -- ).p_value AS pval_new_ctr_per_user,
 
-  `etsy-data-warehouse-prod.functions.power_two_means`(
-    v.n_users,
-    c.n_users,
-    v.avg_new_ctr_per_user - c.avg_new_ctr_per_user,
-    c.sd_new_ctr_per_user
-  ) AS power_new_ctr_per_user
+  -- `etsy-data-warehouse-prod.functions.power_two_means`(
+  --   v.n_users,
+  --   c.n_users,
+  --   v.avg_new_ctr_per_user - c.avg_new_ctr_per_user,
+  --   c.sd_new_ctr_per_user
+  -- ) AS power_new_ctr_per_user,
+
+  ----------------------------------------------------------------------
+  -- NEW SHARE METRICS (user-level, control vs variant, with % change)
+  ----------------------------------------------------------------------
+
+  -- 1) Share of distinct new L2s among all distinct L2s (click side)
+  c.avg_share_distinct_new_L2_clicked_per_user AS control_share_distinct_new_L2_clicked_per_user,
+  v.avg_share_distinct_new_L2_clicked_per_user AS variant_share_distinct_new_L2_clicked_per_user,
+  SAFE_DIVIDE(
+    v.avg_share_distinct_new_L2_clicked_per_user
+      - c.avg_share_distinct_new_L2_clicked_per_user,
+    c.avg_share_distinct_new_L2_clicked_per_user
+  ) AS lift_share_distinct_new_L2_clicked_per_user,
+
+  -- 1b) Share of distinct new L2s among all distinct L2s (impression side)
+  c.avg_share_distinct_new_L2_seen_per_user AS control_share_distinct_new_L2_seen_per_user,
+  v.avg_share_distinct_new_L2_seen_per_user AS variant_share_distinct_new_L2_seen_per_user,
+  SAFE_DIVIDE(
+    v.avg_share_distinct_new_L2_seen_per_user
+      - c.avg_share_distinct_new_L2_seen_per_user,
+    c.avg_share_distinct_new_L2_seen_per_user
+  ) AS lift_share_distinct_new_L2_seen_per_user,
+
+  -- 2) Share of new-mission listing clicks among all listing clicks (per user)
+  c.avg_share_new_mission_clicks_per_user AS control_share_new_mission_clicks_per_user,
+  v.avg_share_new_mission_clicks_per_user AS variant_share_new_mission_clicks_per_user,
+  SAFE_DIVIDE(
+    v.avg_share_new_mission_clicks_per_user
+      - c.avg_share_new_mission_clicks_per_user,
+    c.avg_share_new_mission_clicks_per_user
+  ) AS lift_share_new_mission_clicks_per_user,
+
+  -- 3) Share of new-mission impressions among all impressions (per user)
+  c.avg_share_new_mission_impressions_per_user AS control_share_new_mission_impressions_per_user,
+  v.avg_share_new_mission_impressions_per_user AS variant_share_new_mission_impressions_per_user,
+  SAFE_DIVIDE(
+    v.avg_share_new_mission_impressions_per_user
+      - c.avg_share_new_mission_impressions_per_user,
+    c.avg_share_new_mission_impressions_per_user
+  ) AS lift_share_new_mission_impressions_per_user
 
 FROM variants v
 CROSS JOIN control c
